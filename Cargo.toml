@@ -1,8 +1,16 @@
 [package]
-name = "prog_med"
+name = "project-med"
 version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+hyper = { version = "0.14", features = ["full"] }
+tokio = { version = "1", features = ["full"] }
+hyper-tls = "0.5.0"
+pretty_env_logger = "0.4"
+bytes = "1"
+grep = "0.2"
+anyhow = "1"
+csv = "1"
