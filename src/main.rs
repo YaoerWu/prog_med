@@ -2,6 +2,10 @@ use anyhow::Result;
 use csv::ReaderBuilder;
 use hyper::{body::HttpBody as _, Client};
 use hyper_tls::HttpsConnector;
+use log::LevelFilter;
+use log4rs::append::file::FileAppender;
+use log4rs::config::{Appender, Config, Root};
+use log4rs::encode::pattern::PatternEncoder;
 use serde_derive::Deserialize;
 use std::fs::create_dir;
 use std::path::{Path, PathBuf};
@@ -14,14 +18,15 @@ extern crate log;
 extern crate lazy_static;
 
 #[derive(Deserialize, Debug)]
-struct Config {
+struct UserConfig {
     save_path: String,
     read_path: String,
+    log_path: String,
     download_url: Vec<String>,
 }
 
 lazy_static! {
-    static ref CONFIG: Config = {
+    static ref CONFIG: UserConfig = {
         use std::fs;
         //Enter your config file path here.
         let config_path: &Path = Path::new("./config.toml");
@@ -40,7 +45,14 @@ struct Target {
 //Using CONFIG.read_path
 #[tokio::main]
 async fn main() -> Result<()> {
-    pretty_env_logger::init_timed();
+    let logfile = FileAppender::builder()
+        .encoder(Box::new(PatternEncoder::new("{l} - {m}\n")))
+        .build(&CONFIG.log_path)?;
+    let config = Config::builder()
+        .appender(Appender::builder().build("logfile", Box::new(logfile)))
+        .build(Root::builder().appender("logfile").build(LevelFilter::Info))?;
+
+    log4rs::init_config(config)?;
     debug!("Config : {:?}", *CONFIG);
     debug!("{:?}", Path::new(&CONFIG.read_path));
     let mut data_bank = File::open(&CONFIG.read_path).await?;
@@ -60,6 +72,7 @@ async fn main() -> Result<()> {
             error!("Failed to process data due to \"{}\"", e);
         }
     }
+    info!("Procedure completed successfully. Exiting...");
     Ok(())
 }
 
@@ -148,7 +161,7 @@ async fn process_data(target: Target) -> Result<()> {
             }
         }
     }
-    info!("Target {} downloaded", target.target_name);
+    info!("Target {} processed", target.target_name);
     Ok(())
 }
 
@@ -182,7 +195,6 @@ async fn download_pdb(pdb_id: String, save_path: PathBuf) -> Result<()> {
             continue;
         }
 
-        info!("start download {}", pdb_id);
         let mut file = File::create(&save_filepath).await?;
         while let Some(next) = res.data().await {
             file.write(&next?).await?;
