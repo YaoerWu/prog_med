@@ -1,12 +1,12 @@
 use anyhow::Result;
+use csv::ReaderBuilder;
 use hyper::{body::HttpBody as _, Client};
 use hyper_tls::HttpsConnector;
 use serde_derive::Deserialize;
-use std::env;
 use std::fs::create_dir;
 use std::path::{Path, PathBuf};
 use tokio::fs::File;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task;
 #[macro_use]
 extern crate log;
@@ -30,17 +30,36 @@ lazy_static! {
     };
 }
 
+#[derive(Deserialize, Debug)]
+struct Target {
+    chembl_id: String,
+    target_name: String,
+    uniprot_accession: String,
+}
+
+//Using CONFIG.read_path
 #[tokio::main]
 async fn main() -> Result<()> {
     pretty_env_logger::init_timed();
     debug!("Config : {:?}", *CONFIG);
+    debug!("{:?}", Path::new(&CONFIG.read_path));
+    let mut data_bank = File::open(&CONFIG.read_path).await?;
+    let mut data = Vec::new();
+    data_bank.read_to_end(&mut data).await?;
+    let mut rdr = ReaderBuilder::new().delimiter(b';').from_reader(&*data);
 
-    let (target_name, uniprot_accession) =
-        (env::args().nth(1).unwrap(), env::args().nth(2).unwrap());
-    if let Err(e) = task::spawn(process_data(target_name, uniprot_accession)).await? {
-        error!("Failed to process data due to \"{}\"", e);
+    let mut tasks = Vec::new();
+    for result in rdr.records() {
+        let record = result?;
+        let target: Target = record.deserialize(None)?;
+        tasks.push(task::spawn(process_data(target)));
     }
 
+    for task in tasks {
+        if let Err(e) = task.await? {
+            error!("Failed to process data due to \"{}\"", e);
+        }
+    }
     Ok(())
 }
 
@@ -66,51 +85,74 @@ async fn fetch_data(url: hyper::Uri) -> Result<Vec<u8>> {
     Ok(page)
 }
 
-async fn process_data(target_name: String, uniprot_accession: String) -> Result<()> {
-    info!("Processing data for {}", target_name);
-    let url = format!("https://www.uniprot.org/uniprot/{}.txt", uniprot_accession).parse()?;
-    let page = fetch_data(url).await?;
-
-    let lines = page
-        //split into line
-        .split(|ch| *ch == b'\n')
-        //find PDB ID
-        .filter(|slice| slice.starts_with(b"DR   PDB;"))
-        //extract PDB ID
-        .map(|slice| String::from_utf8_lossy(&slice[10..14]).to_lowercase())
-        //collect PDB IDs
-        .collect::<Vec<_>>();
-
-    //Check if there is no PDB data
-    if lines.is_empty() {
-        warn!("No PDB data found");
-        return Ok(());
-    }
-
-    //Crating folder for target
-    let path = Path::new(&CONFIG.save_path).join(&target_name);
+//Using CONFIG.save_path
+async fn process_data(target: Target) -> Result<()> {
+    info!("Processing data for {}", target.target_name);
+    let path = Path::new(&CONFIG.save_path).join(&target.target_name);
     info!("Crating folder: {}", path.display());
     if !path.exists() {
         create_dir(&path)?;
     }
-
-    //Spawn download tasks
-    let mut tasks: Vec<task::JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
-    for i in lines {
-        debug!("PDB ID : {}", i);
-        tasks.push(task::spawn(download_pdb(i.to_string(), path.clone())));
+    let id_file = path.join(&target.chembl_id);
+    if !id_file.exists() {
+        File::create(&id_file).await?;
     }
+    if target.uniprot_accession.is_empty() {
+        warn!("No Uniprot data for {}", target.target_name);
+        return Ok(());
+    }
+    let uniprot_accessions = target.uniprot_accession.split('|').collect::<Vec<_>>();
+    for uniprot_accession in uniprot_accessions {
+        let url = format!("https://www.uniprot.org/uniprot/{}.txt", uniprot_accession).parse()?;
+        let page = fetch_data(url).await?;
 
-    //Wait until download done
-    for i in tasks {
-        if let Err(e) = i.await? {
-            error!("Failed to download due to \"{}\"", e);
+        let lines = page
+            //split into line
+            .split(|ch| *ch == b'\n')
+            //find PDB ID
+            .filter(|slice| slice.starts_with(b"DR   PDB;"))
+            //extract PDB ID
+            .map(|slice| String::from_utf8_lossy(&slice[10..14]).to_lowercase())
+            //collect PDB IDs
+            .collect::<Vec<_>>();
+
+        //Check if there is no PDB data
+        if lines.is_empty() {
+            warn!(
+                "No PDB data found for {}:{}",
+                &target.target_name, uniprot_accession
+            );
+            continue;
+        }
+
+        //Crating folder for target
+        let path = Path::new(&CONFIG.save_path)
+            .join(&target.target_name)
+            .join(&uniprot_accession);
+        info!("Crating folder: {}", path.display());
+        if !path.exists() {
+            create_dir(&path)?;
+        }
+
+        //Spawn download tasks
+        let mut tasks: Vec<task::JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
+        for pdb_id in lines {
+            debug!("PDB ID : {}", pdb_id);
+            tasks.push(task::spawn(download_pdb(pdb_id, path.clone())));
+        }
+
+        //Wait until download done
+        for task in tasks {
+            if let Err(e) = task.await? {
+                error!("Failed to download due to \"{}\"", e);
+            }
         }
     }
-    info!("Target {} downloaded", target_name);
+    info!("Target {} downloaded", target.target_name);
     Ok(())
 }
 
+//Using CONFIG.download_url
 async fn download_pdb(pdb_id: String, save_path: PathBuf) -> Result<()> {
     let https = HttpsConnector::new();
     let client = Client::builder().build::<_, hyper::Body>(https);
@@ -122,7 +164,11 @@ async fn download_pdb(pdb_id: String, save_path: PathBuf) -> Result<()> {
             if let Some(file_name) = Path::new(url.path()).file_name() {
                 file_name
             } else {
-                return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Check your config urls").into());
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "Check your config urls",
+                )
+                .into());
             }
         });
         debug!("Save path : {}", save_filepath.display());

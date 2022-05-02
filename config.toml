@@ -1,5 +1,5 @@
-save_path = "../"
-read_path = ""
+save_path = "../promed"
+read_path = "../promed/test.csv"
 #Use '%' repalce PDB_ID
 download_url = [
     "https://s3.rcsb.org/pub/pdb/data/structures/all/pdb/pdb%.ent.gz",
