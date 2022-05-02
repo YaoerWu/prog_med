@@ -1,0 +1,7 @@
+save_path = "../"
+read_path = ""
+#Use '%' repalce PDB_ID
+download_url = [
+    "https://s3.rcsb.org/pub/pdb/data/structures/all/pdb/pdb%.ent.gz",
+    "https://s3.rcsb.org/pub/pdb/data/structures/all/mmCIF/%.cif.gz",
+]
