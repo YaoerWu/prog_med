@@ -1,13 +1,13 @@
 [package]
 name = "project-med"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-hyper = { version = "0.14", features = ["full"] }
-tokio = { version = "1", features = ["full"] }
+hyper = { version = "0.14", features = ["client", "http2"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "fs", "macros"] }
 hyper-tls = "0.5.0"
 log = "0.4"
 bytes = "1"

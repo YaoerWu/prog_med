@@ -7,10 +7,12 @@ use log4rs::append::file::FileAppender;
 use log4rs::config::{Appender, Config, Root};
 use log4rs::encode::pattern::PatternEncoder;
 use serde_derive::Deserialize;
-use std::fs::create_dir;
+use std::fs::{create_dir, create_dir_all};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Semaphore;
 use tokio::task;
 #[macro_use]
 extern crate log;
@@ -22,6 +24,8 @@ struct UserConfig {
     save_path: String,
     read_path: String,
     log_path: String,
+    processor_limit: i64,
+    downloader_limit: i64,
     download_url: Vec<String>,
 }
 
@@ -61,10 +65,22 @@ async fn main() -> Result<()> {
     let mut rdr = ReaderBuilder::new().delimiter(b';').from_reader(&*data);
 
     let mut tasks = Vec::new();
-    for result in rdr.records() {
+    let processor_limit = Arc::new(Semaphore::new(CONFIG.processor_limit as usize));
+
+    for (i, result) in rdr.records().enumerate() {
         let record = result?;
         let target: Target = record.deserialize(None)?;
-        tasks.push(task::spawn(process_data(target)));
+        let semaphore = processor_limit.clone();
+        let path_grouped = Path::new(&CONFIG.save_path).join(format!("{}00", i / 100));
+        if !path_grouped.exists() {
+            create_dir_all(&path_grouped)?;
+        }
+        tasks.push(task::spawn(async move {
+            let permit = semaphore.acquire_owned().await.unwrap();
+            process_data(target, path_grouped).await?;
+            drop(permit);
+            Result::<()>::Ok(())
+        }));
     }
 
     for task in tasks {
@@ -99,21 +115,30 @@ async fn fetch_data(url: hyper::Uri) -> Result<Vec<u8>> {
 }
 
 //Using CONFIG.save_path
-async fn process_data(target: Target) -> Result<()> {
+async fn process_data(target: Target, save_path: PathBuf) -> Result<()> {
     info!("Processing data for {}", target.target_name);
-    let path = Path::new(&CONFIG.save_path).join(&target.target_name);
-    info!("Crating folder: {}", path.display());
-    if !path.exists() {
-        create_dir(&path)?;
+    let path_target = save_path.join(&target.target_name.replace('/', "|"));
+    info!("Crating folder: {}", path_target.display());
+    if !path_target.exists() {
+        if let Err(e) = create_dir(&path_target) {
+            error!("Failed to create directory: {}", &path_target.display());
+            return Err(e.into());
+        }
     }
-    let id_file = path.join(&target.chembl_id);
+
+    let id_file = path_target.join(&target.chembl_id);
     if !id_file.exists() {
-        File::create(&id_file).await?;
+        if let Err(e) = File::create(&id_file).await {
+            error!("Failed to create file: {}", &id_file.display());
+            return Err(e.into());
+        }
     }
+
     if target.uniprot_accession.is_empty() {
-        warn!("No Uniprot data for {}", target.target_name);
+        info!("No Uniprot data for {}", target.target_name);
         return Ok(());
     }
+
     let uniprot_accessions = target.uniprot_accession.split('|').collect::<Vec<_>>();
     for uniprot_accession in uniprot_accessions {
         let url = format!("https://www.uniprot.org/uniprot/{}.txt", uniprot_accession).parse()?;
@@ -131,7 +156,7 @@ async fn process_data(target: Target) -> Result<()> {
 
         //Check if there is no PDB data
         if lines.is_empty() {
-            warn!(
+            info!(
                 "No PDB data found for {}:{}",
                 &target.target_name, uniprot_accession
             );
@@ -139,19 +164,25 @@ async fn process_data(target: Target) -> Result<()> {
         }
 
         //Crating folder for target
-        let path = Path::new(&CONFIG.save_path)
-            .join(&target.target_name)
-            .join(&uniprot_accession);
-        info!("Crating folder: {}", path.display());
-        if !path.exists() {
-            create_dir(&path)?;
+        let path_uniprot = path_target.join(&uniprot_accession);
+        info!("Crating folder: {}", path_uniprot.display());
+        if !path_uniprot.exists() {
+            create_dir(&path_uniprot)?;
         }
 
         //Spawn download tasks
+        let downloader_limit = Arc::new(Semaphore::new(CONFIG.downloader_limit as usize));
         let mut tasks: Vec<task::JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
         for pdb_id in lines {
             debug!("PDB ID : {}", pdb_id);
-            tasks.push(task::spawn(download_pdb(pdb_id, path.clone())));
+            let semaphore = downloader_limit.clone();
+            let path_uniprot = path_uniprot.clone();
+            tasks.push(task::spawn(async move {
+                let permit = semaphore.acquire_owned().await.unwrap();
+                download_pdb(pdb_id, path_uniprot).await?;
+                drop(permit);
+                Result::<()>::Ok(())
+            }));
         }
 
         //Wait until download done
@@ -186,7 +217,6 @@ async fn download_pdb(pdb_id: String, save_path: PathBuf) -> Result<()> {
         });
         debug!("Save path : {}", save_filepath.display());
         if save_filepath.exists() {
-            info!("already download {}", pdb_id);
             return Ok(());
         }
 
@@ -199,7 +229,7 @@ async fn download_pdb(pdb_id: String, save_path: PathBuf) -> Result<()> {
         while let Some(next) = res.data().await {
             file.write(&next?).await?;
         }
-        info!("{} downloaded", save_filepath.to_string_lossy());
+
         break;
     }
 
