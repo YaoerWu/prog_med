@@ -2,10 +2,6 @@ use anyhow::Result;
 use csv::ReaderBuilder;
 use hyper::{body::HttpBody as _, Client};
 use hyper_tls::HttpsConnector;
-use log::LevelFilter;
-use log4rs::append::file::FileAppender;
-use log4rs::config::{Appender, Config, Root};
-use log4rs::encode::pattern::PatternEncoder;
 use serde_derive::Deserialize;
 use std::fs::{create_dir, create_dir_all};
 use std::path::{Path, PathBuf};
@@ -23,7 +19,7 @@ extern crate lazy_static;
 struct UserConfig {
     save_path: String,
     read_path: String,
-    log_path: String,
+    log_config: String,
     processor_limit: i64,
     downloader_limit: i64,
     download_url: Vec<String>,
@@ -49,14 +45,7 @@ struct Target {
 //Using CONFIG.read_path
 #[tokio::main]
 async fn main() -> Result<()> {
-    let logfile = FileAppender::builder()
-        .encoder(Box::new(PatternEncoder::new("{l} - {m}\n")))
-        .build(&CONFIG.log_path)?;
-    let config = Config::builder()
-        .appender(Appender::builder().build("logfile", Box::new(logfile)))
-        .build(Root::builder().appender("logfile").build(LevelFilter::Info))?;
-
-    log4rs::init_config(config)?;
+    log4rs::init_file(&CONFIG.log_config, Default::default()).unwrap();
     debug!("Config : {:?}", *CONFIG);
     debug!("{:?}", Path::new(&CONFIG.read_path));
     let mut data_bank = File::open(&CONFIG.read_path).await?;

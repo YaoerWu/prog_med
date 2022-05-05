@@ -1,6 +1,6 @@
 save_path = "Your Downloads file folder"
 read_path = "Your [chembl.csv] which downloaded form https://www.ebi.ac.uk/chembl/"
-log_path = "./output.log"
+log_config = "./log.yml"
 #Limit processor for one Target in sametime
 processor_limit = 4
 #Limit downloads for one Uniprot Target in sametime
