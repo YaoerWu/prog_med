@@ -8,7 +8,13 @@ appenders:
   # An appender named "file" that writes to a file with a custom pattern encoder
   file:
     kind: file
-    path: "log/test.log"
+    path: "log/prog_med.log"
+    encoder:
+      pattern: "[File] {d} - {l} - {t} - {m}{n}"
+
+  debug:
+    kind: file
+    path: "log/debug.log"
     encoder:
       pattern: "[File] {d} - {l} - {t} - {m}{n}"
 
@@ -17,12 +23,13 @@ root:
   level: info
   appenders:
     - stdout
+    - file
 
 loggers:
   # Route log events sent to the "app" logger to the "file" appender,
   # and *not* the normal appenders installed at the root
-  app:
-    level: info
+  debug:
+    level: debug
     appenders:
-      - file
+      - debug
     additive: false

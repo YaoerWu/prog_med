@@ -7,15 +7,15 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug executable 'hellohttp'",
+            "name": "Debug executable 'project-med'",
             "cargo": {
                 "args": [
                     "build",
-                    "--bin=hellohttp",
-                    "--package=hellohttp"
+                    "--bin=project-med",
+                    "--package=project-med"
                 ],
                 "filter": {
-                    "name": "hellohttp",
+                    "name": "project-med",
                     "kind": "bin"
                 }
             },
@@ -25,16 +25,16 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug unit tests in executable 'hellohttp'",
+            "name": "Debug unit tests in executable 'project-med'",
             "cargo": {
                 "args": [
                     "test",
                     "--no-run",
-                    "--bin=hellohttp",
-                    "--package=hellohttp"
+                    "--bin=project-med",
+                    "--package=project-med"
                 ],
                 "filter": {
-                    "name": "hellohttp",
+                    "name": "project-med",
                     "kind": "bin"
                 }
             },

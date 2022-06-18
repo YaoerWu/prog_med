@@ -1,6 +1,7 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use csv::ReaderBuilder;
 use hyper::{body::HttpBody as _, Client};
+use hyper_alpn::AlpnConnector;
 use hyper_tls::HttpsConnector;
 use serde_derive::Deserialize;
 use std::fs::{create_dir, create_dir_all};
@@ -23,6 +24,7 @@ struct UserConfig {
     processor_limit: i64,
     downloader_limit: i64,
     download_url: Vec<String>,
+    retry_count: i64,
 }
 
 lazy_static! {
@@ -46,8 +48,8 @@ struct Target {
 #[tokio::main]
 async fn main() -> Result<()> {
     log4rs::init_file(&CONFIG.log_config, Default::default()).unwrap();
-    debug!("Config : {:?}", *CONFIG);
-    debug!("{:?}", Path::new(&CONFIG.read_path));
+    debug!(target:"debug","Config : {:?}", *CONFIG);
+
     let mut data_bank = File::open(&CONFIG.read_path).await?;
     let mut data = Vec::new();
     data_bank.read_to_end(&mut data).await?;
@@ -60,7 +62,7 @@ async fn main() -> Result<()> {
         let record = result?;
         let target: Target = record.deserialize(None)?;
         let semaphore = processor_limit.clone();
-        let path_grouped = Path::new(&CONFIG.save_path).join(format!("{}00", i / 100));
+        let path_grouped = Path::new(&CONFIG.save_path).join(format!("{}", i));
         if !path_grouped.exists() {
             create_dir_all(&path_grouped)?;
         }
@@ -90,24 +92,60 @@ async fn format(url: &str, formatter: &str) -> Result<String, std::fmt::Error> {
 }
 
 async fn fetch_data(url: hyper::Uri) -> Result<Vec<u8>> {
-    let https = HttpsConnector::new();
-    let client = Client::builder().build::<_, hyper::Body>(https);
-
     let mut page = Vec::new();
+    let mut try_count = 0;
+    let mut is_anyerr = true;
 
-    let mut res = client.get(url).await?;
-    while let Some(next) = res.data().await {
-        page.append(&mut next?.to_vec());
+    while is_anyerr {
+        is_anyerr = false;
+        try_count += 1;
+        if try_count > CONFIG.retry_count {
+            error!("Too many retries downloading {}", url);
+            bail!("Too many retries");
+        }
+        debug!(target:"debug","Trying download {} for {} try(s)", url, try_count);
+
+        let client = Client::builder().build::<_, hyper::Body>(AlpnConnector::new());
+        let mut res = match client.get(url.clone()).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("{} failed to use Alpn due to \"{}\", try Https", url, e);
+                let client = Client::builder().build::<_, hyper::Body>(HttpsConnector::new());
+                match client.get(url.clone()).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!("Err in get : {}", e);
+                        is_anyerr = true;
+                        continue;
+                    }
+                }
+            }
+        };
+
+        if res.status() != hyper::StatusCode::OK {
+            warn!("{} returned a bad response", url);
+            bail!("bad response");
+        }
+
+        while let Some(next) = res.data().await {
+            match next {
+                Ok(data) => page.append(&mut data.to_vec()),
+                Err(e) => {
+                    is_anyerr = true;
+                    warn!("Err in data : {}", e);
+                    break;
+                }
+            }
+        }
     }
 
+    debug!(target:"debug","data lenth : {}", page.len());
     Ok(page)
 }
 
 //Using CONFIG.save_path
 async fn process_data(target: Target, save_path: PathBuf) -> Result<()> {
-    info!("Processing data for {}", target.target_name);
     let path_target = save_path.join(&target.target_name.replace('/', "|"));
-    info!("Crating folder: {}", path_target.display());
     if !path_target.exists() {
         if let Err(e) = create_dir(&path_target) {
             error!("Failed to create directory: {}", &path_target.display());
@@ -154,7 +192,6 @@ async fn process_data(target: Target, save_path: PathBuf) -> Result<()> {
 
         //Crating folder for target
         let path_uniprot = path_target.join(&uniprot_accession);
-        info!("Crating folder: {}", path_uniprot.display());
         if !path_uniprot.exists() {
             create_dir(&path_uniprot)?;
         }
@@ -163,7 +200,7 @@ async fn process_data(target: Target, save_path: PathBuf) -> Result<()> {
         let downloader_limit = Arc::new(Semaphore::new(CONFIG.downloader_limit as usize));
         let mut tasks: Vec<task::JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
         for pdb_id in lines {
-            debug!("PDB ID : {}", pdb_id);
+            debug!(target:"debug","PDB ID : {}", pdb_id);
             let semaphore = downloader_limit.clone();
             let path_uniprot = path_uniprot.clone();
             tasks.push(task::spawn(async move {
@@ -181,18 +218,14 @@ async fn process_data(target: Target, save_path: PathBuf) -> Result<()> {
             }
         }
     }
-    info!("Target {} processed", target.target_name);
     Ok(())
 }
 
 //Using CONFIG.download_url
 async fn download_pdb(pdb_id: String, save_path: PathBuf) -> Result<()> {
-    let https = HttpsConnector::new();
-    let client = Client::builder().build::<_, hyper::Body>(https);
-
     for url in &CONFIG.download_url {
         let url: hyper::Uri = format(url, &pdb_id).await?.parse()?;
-        debug!("Formatted url : {}", url.to_string());
+        debug!(target:"debug","Formatted url : {}", url.to_string());
         let save_filepath = save_path.join({
             if let Some(file_name) = Path::new(url.path()).file_name() {
                 file_name
@@ -204,21 +237,16 @@ async fn download_pdb(pdb_id: String, save_path: PathBuf) -> Result<()> {
                 .into());
             }
         });
-        debug!("Save path : {}", save_filepath.display());
         if save_filepath.exists() {
             return Ok(());
         }
 
-        let mut res = client.get(url).await?;
-        if res.status() != hyper::StatusCode::OK {
-            continue;
-        }
-
+        let data = match fetch_data(url).await {
+            Ok(data) => data,
+            Err(_) => continue,
+        };
         let mut file = File::create(&save_filepath).await?;
-        while let Some(next) = res.data().await {
-            file.write(&next?).await?;
-        }
-
+        file.write_all(&data).await?;
         break;
     }
 
