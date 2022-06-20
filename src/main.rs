@@ -1,8 +1,6 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 use csv::ReaderBuilder;
-use hyper::{body::HttpBody as _, Client};
-use hyper_alpn::AlpnConnector;
-use hyper_tls::HttpsConnector;
+use reqwest::{Client, Url};
 use serde_derive::Deserialize;
 use std::fs::{create_dir, create_dir_all};
 use std::path::{Path, PathBuf};
@@ -24,18 +22,17 @@ struct UserConfig {
     processor_limit: i64,
     downloader_limit: i64,
     download_url: Vec<String>,
-    retry_count: i64,
 }
 
 lazy_static! {
-    static ref CONFIG: UserConfig = {
-        use std::fs;
-        //Enter your config file path here.
-        let config_path: &Path = Path::new("./config.toml");
-        let contents = fs::read_to_string(config_path).unwrap();
-        toml::from_str(&contents).unwrap()
-    };
-}
+static ref CONFIG: UserConfig = {
+    use std::fs;
+    //Enter your config file path here.
+    let config_path: &Path = Path::new("./config.toml");
+    let contents = fs::read_to_string(config_path).unwrap();
+    toml::from_str(&contents).unwrap()
+};
+static ref CLIENT:Client= Client::new();}
 
 #[derive(Deserialize, Debug)]
 struct Target {
@@ -91,58 +88,6 @@ async fn format(url: &str, formatter: &str) -> Result<String, std::fmt::Error> {
     }
 }
 
-async fn fetch_data(url: hyper::Uri) -> Result<Vec<u8>> {
-    let mut page = Vec::new();
-    let mut try_count = 0;
-    let mut is_anyerr = true;
-
-    while is_anyerr {
-        is_anyerr = false;
-        try_count += 1;
-        if try_count > CONFIG.retry_count {
-            error!("Too many retries downloading {}", url);
-            bail!("Too many retries");
-        }
-        debug!(target:"debug","Trying download {} for {} try(s)", url, try_count);
-
-        let client = Client::builder().build::<_, hyper::Body>(AlpnConnector::new());
-        let mut res = match client.get(url.clone()).await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("{} failed to use Alpn due to \"{}\", try Https", url, e);
-                let client = Client::builder().build::<_, hyper::Body>(HttpsConnector::new());
-                match client.get(url.clone()).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        warn!("Err in get : {}", e);
-                        is_anyerr = true;
-                        continue;
-                    }
-                }
-            }
-        };
-
-        if res.status() != hyper::StatusCode::OK {
-            warn!("{} returned a bad response", url);
-            bail!("bad response");
-        }
-
-        while let Some(next) = res.data().await {
-            match next {
-                Ok(data) => page.append(&mut data.to_vec()),
-                Err(e) => {
-                    is_anyerr = true;
-                    warn!("Err in data : {}", e);
-                    break;
-                }
-            }
-        }
-    }
-
-    debug!(target:"debug","data lenth : {}", page.len());
-    Ok(page)
-}
-
 //Using CONFIG.save_path
 async fn process_data(target: Target, save_path: PathBuf) -> Result<()> {
     let path_target = save_path.join(&target.target_name.replace('/', "|"));
@@ -168,16 +113,17 @@ async fn process_data(target: Target, save_path: PathBuf) -> Result<()> {
 
     let uniprot_accessions = target.uniprot_accession.split('|').collect::<Vec<_>>();
     for uniprot_accession in uniprot_accessions {
-        let url = format!("https://www.uniprot.org/uniprot/{}.txt", uniprot_accession).parse()?;
-        let page = fetch_data(url).await?;
+        let url: Url =
+            format!("https://www.uniprot.org/uniprot/{}.txt", uniprot_accession).parse()?;
+        let page = CLIENT.get(url).send().await?.text().await?;
 
         let lines = page
             //split into line
-            .split(|ch| *ch == b'\n')
+            .split('\n')
             //find PDB ID
-            .filter(|slice| slice.starts_with(b"DR   PDB;"))
+            .filter(|slice| slice.starts_with("DR   PDB;"))
             //extract PDB ID
-            .map(|slice| String::from_utf8_lossy(&slice[10..14]).to_lowercase())
+            .map(|slice| slice[10..14].to_lowercase())
             //collect PDB IDs
             .collect::<Vec<_>>();
 
@@ -224,7 +170,7 @@ async fn process_data(target: Target, save_path: PathBuf) -> Result<()> {
 //Using CONFIG.download_url
 async fn download_pdb(pdb_id: String, save_path: PathBuf) -> Result<()> {
     for url in &CONFIG.download_url {
-        let url: hyper::Uri = format(url, &pdb_id).await?.parse()?;
+        let url: Url = format(url, &pdb_id).await?.parse()?;
         debug!(target:"debug","Formatted url : {}", url.to_string());
         let save_filepath = save_path.join({
             if let Some(file_name) = Path::new(url.path()).file_name() {
@@ -241,12 +187,12 @@ async fn download_pdb(pdb_id: String, save_path: PathBuf) -> Result<()> {
             return Ok(());
         }
 
-        let data = match fetch_data(url).await {
-            Ok(data) => data,
+        let data = match CLIENT.get(url).send().await {
+            Ok(data) => data.text().await?,
             Err(_) => continue,
         };
         let mut file = File::create(&save_filepath).await?;
-        file.write_all(&data).await?;
+        file.write_all(data.as_bytes()).await?;
         break;
     }
 
